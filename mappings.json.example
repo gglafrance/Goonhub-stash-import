@@ -1,0 +1,9 @@
+{
+  "path_mappings": [
+    {
+      "stash_prefix": "/data/",
+      "goonhub_prefix": "./data/videos/1",
+      "storage_path_id": 1
+    }
+  ]
+}
