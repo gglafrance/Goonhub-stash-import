@@ -1,56 +1,92 @@
-# Stash to GoonHub Importer
+# Stash → GoonHub importer
 
-Standalone CLI tool that exports data from a [Stash](https://stashapp.cc/) instance and imports it into GoonHub.
+CLI that copies a [Stash](https://stashapp.cc/) library's metadata into GoonHub:
+tags, studios (with parents), performers (with aliases, photo, rating and favorite),
+scenes (with studio, tags, actors, dates, technical metadata), markers (with tags),
+and the current user's interactions (rating, o-counter, view count, watch history and resume position).
 
-## Quick Start
+**Stash is only ever read.** The client refuses to send anything other than a GraphQL
+`query` (see `internal/stash/client.go`). Media files are never touched: GoonHub only
+references the paths.
+
+## Quick start
 
 ```bash
-# Configure credentials and path mappings
-cp .env.example .env && vi .env
-cp mappings.json.example mappings.json && vi mappings.json
+cp config.example.yaml config.yaml   # edit path_mappings
+cp .env.example .env                 # secrets: STASH_API_KEY, GOONHUB_USERNAME, GOONHUB_PASSWORD...
 
-# Preview what will be imported (no changes made)
-DRY_RUN=true go run .
-
-# Run the import
-go run .
+go run . check                # read-only preflight: connectivity, storage paths, path-mapping coverage
+go run . import --dry-run     # simulate everything, write nothing
+go run . import --limit 20    # small batch
+go run . verify --limit 20    # compare Stash and GoonHub scene by scene
+go run . import               # everything (resumable, Ctrl-C safe)
+go run . process              # start GoonHub processing (thumbnails, sprites) for the imported scenes
 ```
+
+## Commands
+
+| command | what it does |
+|---|---|
+| `import` (default) | imports the enabled phases, then triggers the search reindex (and processing if `post_import.process.enabled`) |
+| `check` | read-only: Stash/GoonHub connectivity, admin role, existence of the storage paths, the number of scenes per mapping, unmapped paths |
+| `verify` | for every selected scene: path, studio, tags, actors, markers and (v2) interactions. Report: `import_report.verify.json` |
+| `process` | submits `post_import.process.phases` for the scenes in the state (all, or `--ids` Stash IDs) |
+| `status` | per-kind counts in the state file and the latest failures |
+
+Common flags: `--config`, `--dry-run`, `--limit N`, `--ids 1,2,3` (Stash IDs), `--on-existing skip|merge`,
+`--concurrency N`, `--phases tags,studios,performers,scenes,markers,interactions`, `--log-level debug`,
+`--state FILE`, `--report FILE`, `--api-mode auto|v1|v2`.
+
+Exit codes: `0` OK, `1` errors or mismatches (details in the report), `2` configuration or connection error.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your credentials. Copy `mappings.json.example` to `mappings.json` and configure path mappings between Stash and GoonHub file paths.
+Everything lives in `config.yaml`. `config.example.yaml` documents every key. Highlights:
 
-## Import Phases
+- **`path_mappings`**: Stash prefix → GoonHub prefix (as seen by the GoonHub server) + `storage_path_id`.
+  The longest prefix wins and matching respects folder boundaries (`/data` never matches `/data2`).
+  `check` shows the coverage.
+- **`on_existing`**: `skip` (default) leaves already-imported entities alone. `merge` re-syncs those
+  whose Stash data changed (a hash per entity in the state file).
+- **`matching`**: reuse existing GoonHub entities by name (`name_ci`, `name`, `none`).
+  `use_disambiguation` keeps Stash homonyms apart.
+- **`scenes.filter`**: a Stash `SceneFilterType` passed as-is (e.g. `{organized: true}`), plus `ids` and `limit`.
+- **`tags.rename` / `tags.exclude`**, **`scenes.type_rules`** (tag → GoonHub type), **`markers.color_by_tag`**.
+- **`interactions`** and **`images`**: choose what to carry over.
 
-The importer runs 5 sequential phases, saving progress to `id_map.json` after each:
+`${VAR}` and `${VAR:-default}` are expanded from the environment / `.env`.
+Without a `config.yaml`, the legacy v1 format (`.env` + `mappings.json`) is still read.
 
-1. **Tags** — matched by name (case-insensitive)
-2. **Studios** — two passes (create, then set parent relationships)
-3. **Performers → Actors**
-4. **Scenes** — uses first file for path/metadata, tagged with `origin: "stash"`
-5. **Markers** — assigned to the user specified by `GOONHUB_MARKER_USER_ID`
+## Reliability
 
-Re-running is safe — entities already in `id_map.json` or matched by name are skipped.
+- **State file** (`import_state.json`): Stash ID → GoonHub ID + status (`ok`, `partial`, `failed`) for every
+  entity. It is saved every 5 s and on exit, with an atomic write. A re-run only redoes what is incomplete.
+  The legacy `id_map.json` is migrated automatically.
+- **Without a state file** (lost or deleted), there are no duplicates. Tags, studios and performers are
+  matched by name, scenes by path (409), and markers by (scene, timestamp, label).
+- **Retries** with exponential backoff on network errors and 429/502/503 (and 500/504 for idempotent
+  requests), automatic re-login on 401.
+- **Report** (`import_report.json`): every error and warning, plus the Stash data GoonHub cannot store
+  (scene code/director/urls, extra files, tag hierarchy, and marker ends when the server lacks the `marker_end` feature...).
 
-## Post-Import
+## GoonHub import API: v1 and v2
 
-```bash
-# Rebuild the search index
-curl -X POST http://localhost:8080/api/v1/admin/search/reindex \
-  -H "Authorization: Bearer <token>"
-```
+The importer detects the server's API (`GET /api/v1/admin/import/capabilities`):
 
-Imported scenes have no thumbnails, sprites, or VTT files. Trigger processing via the GoonHub admin UI or API.
+- **v2** (GoonHub with `docs/import-api.md`): one call per scene, **atomic** (scene + tags + actors +
+  studio + interactions in a single transaction). Markers are deduplicated server-side and the
+  summary endpoint is used for `verify`. View count and watch history are imported.
+- **v1** (older GoonHub): the scene is created, then linked in several calls (a failure leaves it
+  `partial` and the next run retries it). View count and watch history can't be imported in v1.
 
-## Project Structure
+## Layout
 
-- `main.go` - Entry point and orchestration
-- `config.go` - Config loading from `.env` and `mappings.json`
-- `stash_client.go` - Stash GraphQL API client
-- `stash_types.go` - Stash response type definitions
-- `goonhub_client.go` - GoonHub REST API client with retry logic
-- `goonhub_types.go` - GoonHub request/response type definitions
-- `importer.go` - Core import logic (5 phases)
-- `id_map.go` - ID mapping persistence (JSON file)
-- `path_mapper.go` - Stash → GoonHub path translation
-- `schema.graphql` - Stash GraphQL schema (reference)
+- `main.go`: CLI
+- `internal/config`: YAML config, env expansion, validation, legacy format
+- `internal/stash`: read-only, paginated GraphQL client, asset download
+- `internal/goonhub`: REST client (re-login, retries, pagination, v1/v2)
+- `internal/importer`: phases, transformations, verify, check, report
+- `internal/state`: persistent state
+- `internal/pathmap`: path translation
+- `internal/httpx`: retry policy
+- `schema.graphql`: old Stash schema, for reference only (the live schema has evolved)

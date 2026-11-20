@@ -1,4 +1,9 @@
 .env
-id_map.json
+config.yaml
 mappings.json
+id_map.json
+import_state.json
+import_state.json.tmp
+import_report*.json
 goonhub-stash-importer
+goonhub-stash-importer.exe

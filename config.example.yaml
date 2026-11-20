@@ -1,0 +1,103 @@
+# goonhub-stash-import configuration.
+# ${VAR} and ${VAR:-default} are expanded from the environment (and from .env if present).
+# Keep secrets in the environment / .env, not in this file.
+
+stash:
+  url: ${STASH_URL:-http://localhost:9999}
+  api_key: ${STASH_API_KEY}
+  page_size: 250          # scenes per GraphQL page (1-1000)
+  timeout: 120s
+
+goonhub:
+  url: ${GOONHUB_URL:-http://localhost:8080}
+  username: ${GOONHUB_USERNAME}
+  password: ${GOONHUB_PASSWORD}   # must be an admin; markers/ratings are attributed to this user
+  timeout: 60s
+  api_mode: auto          # auto | v1 | v2 (v2 = atomic import endpoint, needs GoonHub with import API v2)
+
+state_file: import_state.json     # Stash -> GoonHub IDs + per-entity status (resume / retry)
+report_file: import_report.json   # every error/warning of the last run
+dry_run: false
+concurrency: 4            # scenes processed in parallel
+on_existing: skip         # skip: leave already-imported entities alone | merge: re-sync those whose Stash data changed
+
+log:
+  level: info             # debug prints one line per entity
+  progress_every: 500
+
+retry:
+  max_attempts: 5
+  initial_backoff: 1s
+  max_backoff: 30s
+
+phases:
+  tags: true
+  studios: true
+  performers: true
+  scenes: true
+  markers: true
+  interactions: true      # ratings, o-counter, play count/history, resume, performer favorites
+
+matching:                 # how to reuse entities that already exist in GoonHub
+  tags: name_ci           # name_ci | name | none
+  studios: name_ci
+  performers: name_ci
+  use_disambiguation: true  # "Name (disambiguation)" so homonyms are not merged
+
+tags:
+  rename: {}              # {"Stash name": "GoonHub name"}; several tags renamed to one name are merged
+  exclude: []             # Stash tag names never imported nor attached
+  color: ""               # color of created tags ("" = GoonHub default)
+
+performers:
+  import_aliases: true
+  gender_map: {}          # override, e.g. {NON_BINARY: other}
+
+scenes:
+  filter: {}              # Stash SceneFilterType, e.g. {organized: true} or {tags: {value: ["12"], modifier: INCLUDES}}
+  ids: []                 # only these Stash scene IDs
+  limit: 0                # 0 = no limit
+  sort: id                # pagination order (keep stable for resume)
+  skip_file_check: false  # true = GoonHub does not check the file exists at the mapped path
+  title_fallback: basename_no_ext   # basename_no_ext | basename (when the Stash scene has no title)
+  origin: stash
+  type: ""                # default GoonHub type
+  type_rules: []          # first match wins, e.g. [{tag: VR, type: vr}, {tag: JAV, type: jav}]
+  preserve_created_at: true   # keep the Stash "added" date (v2)
+  unmapped_path: error    # error | skip — scene whose path matches no mapping
+
+markers:
+  color: "#FFFFFF"
+  color_by_tag: {}        # {"Primary tag name": "#FF4D4D"}
+  tags: primary_and_extra # primary_and_extra | extra | none
+
+interactions:
+  rating: true            # rating100 -> stars (0.5 step)
+  o_counter: true         # -> jizzed count
+  play_count: true        # -> view count (v2)
+  play_history: true      # -> watch history (v2)
+  resume: true            # resume time on the last watch (v2)
+
+images:
+  performers: true        # download from Stash, upload to GoonHub
+  scene_covers: false     # Stash screenshot as GoonHub thumbnail (otherwise GoonHub generates them)
+
+# Stash path prefix -> GoonHub path prefix (as seen by the GoonHub server/container).
+# The longest prefix wins and only matches on a folder boundary (/data never matches /data2).
+path_mappings:
+  - stash_prefix: /data/
+    goonhub_prefix: /media/stash/data/
+    storage_path_id: 2
+  - stash_prefix: /data2
+    goonhub_prefix: /media/stash/data2
+    storage_path_id: 3
+  - stash_prefix: /coomer-dl
+    goonhub_prefix: /media/stash/coomer-dl
+    storage_path_id: 4
+
+post_import:
+  reindex: true           # rebuild the search index once at the end
+  process:
+    enabled: false        # submit processing jobs for the scenes created in this run
+    phases: [metadata, thumbnail, sprites]
+    mode: missing         # missing | all
